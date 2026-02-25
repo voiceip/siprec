@@ -40,6 +40,9 @@ func DecodeAudioPayload(payload []byte, codecName string) ([]byte, error) {
 	case "G722":
 		// G.722 wideband - decode using SB-ADPCM decoder
 		return decodeG722Packet(payload)
+	case "G729", "G729A", "G.729", "G.729A":
+		// G.729 narrowband CS-ACELP at 8 kbps
+		return decodeG729Packet(payload)
 	case "EVS", "EVS_WB", "EVS_SWB":
 		// Enhanced Voice Services
 		var codecInfo CodecInfo

@@ -559,6 +559,136 @@ func encodeMuLaw(sample int16) byte {
 	return ^(sign | byte(exponent<<4) | byte(mantissa))
 }
 
+// TestDecodeAudioPayload_G729 tests G.729/G.729A decoding
+func TestDecodeAudioPayload_G729(t *testing.T) {
+	// A minimal 10-byte "speech" frame (all zeros is a valid frame).
+	speechFrame := make([]byte, 10)
+
+	t.Run("NO_DATA 0-byte payload returns 160 bytes silence", func(t *testing.T) {
+		result, err := DecodeAudioPayload([]byte{}, "G729")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result) != 160 {
+			t.Errorf("expected 160 bytes, got %d", len(result))
+		}
+	})
+
+	t.Run("SID 2-byte payload returns 160 bytes comfort noise", func(t *testing.T) {
+		result, err := DecodeAudioPayload([]byte{0x01, 0x02}, "G729")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result) != 160 {
+			t.Errorf("expected 160 bytes, got %d", len(result))
+		}
+	})
+
+	t.Run("single 10-byte speech frame returns 160 bytes PCM", func(t *testing.T) {
+		result, err := DecodeAudioPayload(speechFrame, "G729")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result) != 160 {
+			t.Errorf("expected 160 bytes, got %d", len(result))
+		}
+		// Verify output is valid 16-bit PCM
+		for i := 0; i < len(result); i += 2 {
+			_ = int16(binary.LittleEndian.Uint16(result[i:]))
+		}
+	})
+
+	t.Run("two 10-byte frames (20 bytes) returns 320 bytes PCM", func(t *testing.T) {
+		result, err := DecodeAudioPayload(make([]byte, 20), "G729")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result) != 320 {
+			t.Errorf("expected 320 bytes, got %d", len(result))
+		}
+	})
+
+	t.Run("invalid 5-byte payload returns error", func(t *testing.T) {
+		_, err := DecodeAudioPayload(make([]byte, 5), "G729")
+		if err == nil {
+			t.Error("expected error for invalid payload length")
+		}
+	})
+
+	t.Run("invalid 15-byte payload returns error", func(t *testing.T) {
+		_, err := DecodeAudioPayload(make([]byte, 15), "G729")
+		if err == nil {
+			t.Error("expected error for invalid payload length")
+		}
+	})
+
+	// Alias names
+	for _, name := range []string{"G729A", "G.729", "G.729A"} {
+		name := name
+		t.Run("alias "+name, func(t *testing.T) {
+			result, err := DecodeAudioPayload(speechFrame, name)
+			if err != nil {
+				t.Fatalf("codec %q: unexpected error: %v", name, err)
+			}
+			if len(result) != 160 {
+				t.Errorf("codec %q: expected 160 bytes, got %d", name, len(result))
+			}
+		})
+	}
+}
+
+// TestG729ParseBits verifies bit extraction from G.729 frames
+func TestG729ParseBits(t *testing.T) {
+	// Frame: 0xFF 0x00 0xFF 0x00 ...
+	var frame [10]byte
+	frame[0] = 0xFF // 11111111
+	frame[1] = 0x00 // 00000000
+	frame[2] = 0xFF // 11111111
+
+	// Bits 0-7 of frame[0] should all be 1
+	v := g729ParseBits(frame, 0, 8)
+	if v != 0xFF {
+		t.Errorf("expected 0xFF, got 0x%X", v)
+	}
+
+	// Bits 8-15 of frame[1] should all be 0
+	v = g729ParseBits(frame, 8, 8)
+	if v != 0x00 {
+		t.Errorf("expected 0x00, got 0x%X", v)
+	}
+
+	// 4 bits crossing byte boundary: bits 6-9 = last 2 of frame[0] + first 2 of frame[1]
+	// frame[0] bits 6-7 = 11, frame[1] bits 0-1 = 00 → 1100 = 12
+	v = g729ParseBits(frame, 6, 4)
+	if v != 0b1100 {
+		t.Errorf("expected 12 (0b1100), got %d", v)
+	}
+}
+
+// TestG729AlgebraicCB verifies the algebraic codebook produces 4 non-zero pulses
+func TestG729AlgebraicCB(t *testing.T) {
+	// c=0 (all tracks at position 0), s=0 (all positive)
+	vec := g729AlgebraicCB(0, 0)
+	nonZero := 0
+	for _, v := range vec {
+		if v != 0 {
+			nonZero++
+		}
+	}
+	if nonZero == 0 {
+		t.Error("expected non-zero pulses in algebraic codebook output")
+	}
+}
+
+// BenchmarkDecodeAudioPayload_G729 benchmarks G.729 decoding
+func BenchmarkDecodeAudioPayload_G729(b *testing.B) {
+	data := make([]byte, 160) // 20ms = 16 frames
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		DecodeAudioPayload(data, "G729")
+	}
+}
+
 // BenchmarkDecodeAudioPayload_PCMU benchmarks μ-law decoding
 func BenchmarkDecodeAudioPayload_PCMU(b *testing.B) {
 	data := make([]byte, 160) // 20ms of audio at 8kHz

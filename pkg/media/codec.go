@@ -24,6 +24,7 @@ var SupportedCodecs = map[byte]CodecInfo{
 	0:   {Name: "PCMU", PayloadType: 0, SampleRate: 8000, Channels: 1, Description: "G.711 μ-law"},
 	8:   {Name: "PCMA", PayloadType: 8, SampleRate: 8000, Channels: 1, Description: "G.711 a-law"},
 	9:   {Name: "G722", PayloadType: 9, SampleRate: 16000, Channels: 1, Description: "G.722 wideband"},
+	18:  {Name: "G729", PayloadType: 18, SampleRate: 8000, Channels: 1, Description: "G.729 CS-ACELP narrowband"},
 	96:  {Name: "OPUS", PayloadType: 96, SampleRate: 48000, Channels: 2, Description: "Opus codec"},
 	97:  {Name: "EVS", PayloadType: 97, SampleRate: 16000, Channels: 1, Description: "Enhanced Voice Services"},
 	98:  {Name: "OPUS_MONO", PayloadType: 98, SampleRate: 48000, Channels: 1, Description: "Opus mono"},
