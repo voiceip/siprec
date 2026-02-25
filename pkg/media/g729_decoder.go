@@ -166,9 +166,10 @@ type g729Decoder struct {
 	cngSeed uint32
 
 	// Post-filter state
-	pfSpeechBuf [250]float32       // recent speech for pitch long-term post-filter
+	pfSpeechBuf [250]float32         // recent speech for pitch long-term post-filter
 	pfSTMem     [g729LPOrder]float32 // short-term post-filter IIR memory
 	pfFIRMem    [g729LPOrder]float32 // FIR (A(z/γ₁)) state
+	pfTiltMem   float32              // Tilt compensation memory
 }
 
 func newG729Decoder() *g729Decoder {
@@ -457,16 +458,16 @@ func (d *g729Decoder) decodePitchLag(p, sf int) (intLag, frac int) {
 		}
 	} else {
 		// ITU-T G.729: search window [T_min, T_min+9] with 1/3-sample steps.
-		// T_min = clamp(T1 - 5, 20, 147).
 		tMin := d.prevIntLag - 5
 		if tMin < 20 {
 			tMin = 20
 		}
+		// FIX: Clamp the start of the window so the end doesn't exceed 147
+		if tMin > 138 {
+			tMin = 138
+		}
 		intLag = tMin + p/3
 		frac = p % 3
-		if intLag > 147 {
-			intLag = 147
-		}
 	}
 
 	d.prevIntLag = intLag
@@ -480,7 +481,9 @@ func (d *g729Decoder) decodePitchLag(p, sf int) (intLag, frac int) {
 
 // g729AlgebraicCB decodes a 40-sample sparse excitation vector.
 // c (13 bits) encodes: bits[12:4] = 9 position bits (3 per track 0-2),
-//                       bits[3:0]  = 4 position bits for track 3.
+//
+//	bits[3:0]  = 4 position bits for track 3.
+//
 // s (4 bits) = one sign bit per track.
 func g729AlgebraicCB(c, s int) [g729SubframeSize]float32 {
 	var v [g729SubframeSize]float32
@@ -635,15 +638,17 @@ func (d *g729Decoder) postFilter(speech [g729SubframeSize]float32, lpc [10]float
 
 	// ── 1. Long-term post-filter ──────────────────────────────────────────
 	// H_ltp(z) = (1 + β·z^{-T}) / (1+β)
-	// pfSpeechBuf holds recent (already post-filtered) speech.
-	// Index calculation mirrors getAdaptiveSample but uses pfSpeechBuf.
 	var ltpOut [g729SubframeSize]float32
 	bufLen := len(d.pfSpeechBuf)
 	for n := 0; n < g729SubframeSize; n++ {
 		histIdx := bufLen + n - intLag
 		var past float32
-		if histIdx >= 0 && histIdx < bufLen {
+		if histIdx < bufLen {
+			// Read from past subframes
 			past = d.pfSpeechBuf[histIdx]
+		} else {
+			// FIX: Periodic extension for short lags (read from current subframe)
+			past = ltpOut[histIdx-bufLen]
 		}
 		ltpOut[n] = (speech[n] + g729PitchPostBeta*past) / (1.0 + g729PitchPostBeta)
 	}
@@ -699,23 +704,39 @@ func (d *g729Decoder) postFilter(speech [g729SubframeSize]float32, lpc [10]float
 	}
 	copy(d.pfSTMem[:], iirMem[:])
 
+	// ── 2.5 Tilt compensation ─────────────────────────────────────────────
+	// H_t(z) = 1 - μ·z^{-1}
+	// A standard proxy for μ is derived from the first LPC reflection coefficient.
+	mu := float32(0.2) * lpc[0]
+	if mu > 0.8 {
+		mu = 0.8
+	} else if mu < -0.8 {
+		mu = -0.8
+	}
+
+	var tiltOut [g729SubframeSize]float32
+	for n := 0; n < g729SubframeSize; n++ {
+		tiltOut[n] = out[n] - mu*d.pfTiltMem
+		d.pfTiltMem = out[n]
+	}
+
 	// ── 3. Gain normalisation ─────────────────────────────────────────────
-	// Scale out[] to match the energy of speech[] to prevent volume drift.
+	// Scale to match the energy of the original speech[] to prevent volume drift.
 	var inEnergy, outEnergy float32
 	for n := 0; n < g729SubframeSize; n++ {
 		inEnergy += speech[n] * speech[n]
-		outEnergy += out[n] * out[n]
+		outEnergy += tiltOut[n] * tiltOut[n] // FIX: Use tiltOut for energy
 	}
+
 	if outEnergy > 1e-10 {
 		scale := float32(math.Sqrt(float64(inEnergy / outEnergy)))
 		if scale > 2.0 {
 			scale = 2.0
 		}
 		for n := 0; n < g729SubframeSize; n++ {
-			out[n] *= scale
+			out[n] = tiltOut[n] * scale // FIX: Apply scale to tiltOut, save to out
 		}
 	} else {
-		// No energy in post-filter output → pass through unchanged
 		copy(out[:], speech[:])
 	}
 
