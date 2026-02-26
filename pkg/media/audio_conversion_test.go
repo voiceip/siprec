@@ -665,24 +665,32 @@ func TestG729ParseBits(t *testing.T) {
 	}
 }
 
-// TestG729AlgebraicCB verifies the algebraic codebook produces 4 non-zero pulses
+// TestG729AlgebraicCB verifies the algebraic codebook produces exactly 4 non-zero pulses (one per track)
 func TestG729AlgebraicCB(t *testing.T) {
-	// c=0 (all tracks at position 0), s=0 (all positive)
-	vec := g729AlgebraicCB(0, 0)
-	nonZero := 0
-	for _, v := range vec {
-		if v != 0 {
-			nonZero++
-		}
+	testCases := []struct {
+		c, s          int
+		expectedCount int
+	}{
+		{0, 0, 4},
+		{0x1FFF, 0xF, 4},
 	}
-	if nonZero == 0 {
-		t.Error("expected non-zero pulses in algebraic codebook output")
+	for _, tc := range testCases {
+		vec := g729AlgebraicCB(tc.c, tc.s)
+		nonZero := 0
+		for _, v := range vec {
+			if v != 0 {
+				nonZero++
+			}
+		}
+		if nonZero != tc.expectedCount {
+			t.Errorf("c=%d s=%d: expected %d pulses, got %d", tc.c, tc.s, tc.expectedCount, nonZero)
+		}
 	}
 }
 
 // BenchmarkDecodeAudioPayload_G729 benchmarks G.729 decoding
 func BenchmarkDecodeAudioPayload_G729(b *testing.B) {
-	data := make([]byte, 160) // 20ms = 16 frames
+	data := make([]byte, 160) // 160ms = 16 frames (10ms each)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		DecodeAudioPayload(data, "G729")

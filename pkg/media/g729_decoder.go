@@ -188,12 +188,17 @@ func newG729Decoder() *g729Decoder {
 	return d
 }
 
-// =============================================================================
-// Entry point
-// =============================================================================
+// NewG729Decoder creates a reusable G.729 decoder that preserves inter-frame
+// state (LSP memory, excitation history, gain prediction) across consecutive
+// RTP packets. Callers should retain a single instance per RTP stream and call
+// DecodePacket for each incoming payload. Not safe for concurrent use.
+func NewG729Decoder() *g729Decoder {
+	return newG729Decoder()
+}
 
-// decodeG729Packet converts a G.729/G.729A RTP payload to 16-bit LE PCM.
-func decodeG729Packet(payload []byte) ([]byte, error) {
+// DecodePacket converts a G.729/G.729A RTP payload to 16-bit LE PCM, preserving
+// decoder state across calls for better audio continuity.
+func (d *g729Decoder) DecodePacket(payload []byte) ([]byte, error) {
 	n := len(payload)
 	switch {
 	case n == 0:
@@ -205,18 +210,29 @@ func decodeG729Packet(payload []byte) ([]byte, error) {
 	}
 
 	numFrames := n / 10
-	dec := newG729Decoder()
 	out := make([]byte, numFrames*160)
 
 	for i := 0; i < numFrames; i++ {
 		var frame [10]byte
 		copy(frame[:], payload[i*10:(i+1)*10])
-		samples := dec.decodeFrame(frame)
+		samples := d.decodeFrame(frame)
 		for j, s := range samples {
 			binary.LittleEndian.PutUint16(out[i*160+j*2:], uint16(s))
 		}
 	}
 	return out, nil
+}
+
+// =============================================================================
+// Entry point
+// =============================================================================
+
+// decodeG729Packet converts a G.729/G.729A RTP payload to 16-bit LE PCM.
+// Creates a fresh decoder per call; for cross-packet state preservation use
+// NewG729Decoder() + DecodePacket().
+func decodeG729Packet(payload []byte) ([]byte, error) {
+	dec := newG729Decoder()
+	return dec.DecodePacket(payload)
 }
 
 func g729SIDFrame(sid []byte) []byte {
@@ -385,10 +401,11 @@ func (d *g729Decoder) decodeLSP(l0, l1, l2, l3 int) [2][10]float32 {
 			curLSP[i] = -0.9999
 		}
 	}
-	// Enforce strict monotonic ordering (LSPs are sorted by frequency)
+	// Enforce strict monotonic ordering with minimum spacing per ITU-T G.729
+	const lspMinGap = float32(0.03)
 	for i := 1; i < 10; i++ {
-		if curLSP[i] >= curLSP[i-1] {
-			curLSP[i] = curLSP[i-1] - 0.005
+		if curLSP[i] >= curLSP[i-1]-lspMinGap {
+			curLSP[i] = curLSP[i-1] - lspMinGap
 		}
 	}
 
@@ -468,6 +485,11 @@ func (d *g729Decoder) decodePitchLag(p, sf int) (intLag, frac int) {
 		}
 		intLag = tMin + p/3
 		frac = p % 3
+	}
+
+	if intLag > 147 {
+		intLag = 147
+		frac = 0
 	}
 
 	d.prevIntLag = intLag
@@ -604,11 +626,10 @@ func (d *g729Decoder) lpSynthesis(exc [g729SubframeSize]float32, a [10]float32) 
 		for k := 0; k < g729LPOrder; k++ {
 			s -= a[k] * mem[k]
 		}
-		// Soft saturation prevents filter blow-up while preserving headroom.
-		if s > 4.0 {
-			s = 4.0
-		} else if s < -4.0 {
-			s = -4.0
+		if s > 8.0 {
+			s = 8.0
+		} else if s < -8.0 {
+			s = -8.0
 		}
 		copy(mem[1:], mem[:9])
 		mem[0] = s
