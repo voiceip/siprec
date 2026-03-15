@@ -600,6 +600,7 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 			if sampleRate <= 0 {
 				sampleRate = 8000
 			}
+			isReordered := false
 			if lastSeq != nil {
 				expectedNext := uint16(*lastSeq + 1)
 				seq := rtpPacket.SequenceNumber
@@ -607,6 +608,7 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 					// Reordered (late) packet: seq is earlier than lastSeq in the 16-bit window.
 					// uint16(*lastSeq-seq) < 32768 means the packet is in the recent half, not wraparound.
 					if seq <= *lastSeq && uint16(*lastSeq-seq) < 32768 {
+						isReordered = true
 						// Out-of-order arrival: skip PLC, do not insert silence.
 					} else {
 						var lost int
@@ -663,8 +665,10 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 				}
 				return
 			}
-			seq := rtpPacket.SequenceNumber
-			lastSeq = &seq
+			if !isReordered {
+				seq := rtpPacket.SequenceNumber
+				lastSeq = &seq
+			}
 			if sttWriter != nil && len(transcriptionPayload) > 0 {
 				if _, err := sttWriter.Write(transcriptionPayload); err != nil {
 					if errors.Is(err, io.ErrClosedPipe) {
