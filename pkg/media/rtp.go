@@ -499,6 +499,7 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 		var lastSeq *uint16      // for PLC: insert silence when sequence gaps are detected
 		var lastTimestamp uint32  // RTP timestamp of last processed packet
 		var hasLastTimestamp bool
+		var lastDecodedPCMSize int // actual PCM bytes produced by last decoded packet (for PLC)
 		decodeAndProcess := func(packet []byte, arrival time.Time, remoteAddr *net.UDPAddr) {
 			if len(packet) == 0 {
 				return
@@ -561,6 +562,28 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 
 			payload := rtpPacket.Payload
 			if len(payload) == 0 {
+				return
+			}
+
+			// Skip non-audio payload types: once the audio codec PT is
+			// established, packets with a different PT are event payloads
+			// (e.g. RFC 2833 DTMF on a dynamic PT) — not audio. Decoding
+			// them with the audio codec produces errors or garbage and
+			// creates sequence-number gaps that trigger spurious PLC.
+			if currentPayloadType != 0 && byte(rtpPacket.PayloadType) != currentPayloadType {
+				if dtmfCh != nil {
+					select {
+					case dtmfCh <- AcousticEvent{
+						Type:       "dtmf",
+						Confidence: 0.9,
+						Timestamp:  time.Now(),
+						Details: map[string]interface{}{
+							"payload_type": rtpPacket.PayloadType,
+						},
+					}:
+					default:
+					}
+				}
 				return
 			}
 
@@ -645,7 +668,10 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 								lost = maxPLC
 							}
 							if lost > 0 {
-								bytesPerPacket := PCMBytesPerPacket(codecName, sampleRate)
+								bytesPerPacket := lastDecodedPCMSize
+								if bytesPerPacket <= 0 {
+									bytesPerPacket = PCMBytesPerPacket(codecName, sampleRate)
+								}
 								silenceLen := lost * bytesPerPacket
 								if silenceLen > 0 {
 									silence := make([]byte, silenceLen)
@@ -660,6 +686,8 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 					}
 				}
 			}
+
+			lastDecodedPCMSize = len(pcm)
 
 			recordingPayload, transcriptionPayload, procErr := prepareRecordingAndTranscriptionPayloads(pcm, forwarder, config.AudioProcessing.Enabled, callUUID)
 			if procErr != nil {
