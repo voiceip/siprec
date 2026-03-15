@@ -608,10 +608,73 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 				codecName = "PCMU"
 			}
 
+			isG729 := codecName == "G729" || codecName == "G.729" || codecName == "G729A"
+
+			// Packet loss concealment (PLC): fill gaps from missing packets so the
+			// recording stays time-accurate and stereo combine aligns both legs.
+			// For G.729 we MUST run frame-erasure concealment through the decoder
+			// BEFORE decoding the current packet; otherwise the decoder's internal
+			// state (adaptive codebook, LP synthesis filter) diverges from what the
+			// encoder assumed, producing distortion that propagates for several
+			// frames.  For other codecs we insert silence after decoding.
+			sampleRate := currentSampleRate
+			if sampleRate <= 0 {
+				sampleRate = 8000
+			}
+			isReordered := false
+			var lostPackets int
+			// 60ms of audio samples at the current rate; gaps larger than this are DTX
+			dtxTimestampThreshold := uint32(sampleRate * 60 / 1000)
+			if lastSeq != nil {
+				expectedNext := uint16(*lastSeq + 1)
+				seq := rtpPacket.SequenceNumber
+				if seq != expectedNext {
+					if uint16(*lastSeq-seq) < 32768 {
+						isReordered = true
+					} else if hasLastTimestamp {
+						tsGap := rtpPacket.Timestamp - lastTimestamp
+						if tsGap <= dtxTimestampThreshold {
+							if seq > expectedNext {
+								lostPackets = int(seq - expectedNext)
+							} else {
+								lostPackets = int(seq) + (65536 - int(expectedNext))
+							}
+							lostPackets -= nonAudioSinceLastAudio
+							if lostPackets < 0 {
+								lostPackets = 0
+							}
+							const maxPLC = 10
+							if lostPackets > maxPLC {
+								lostPackets = maxPLC
+							}
+						}
+					}
+				}
+			}
+
+			// G.729 frame-erasure concealment: feed the decoder before decoding so
+			// that its state tracks the lost frames and the next real frame decodes
+			// cleanly. Each RTP packet carries 2 G.729 frames (20ms).
+			if isG729 && lostPackets > 0 {
+				lostFrames := lostPackets * (len(payload) / 10)
+				if lostFrames <= 0 {
+					lostFrames = lostPackets * 2
+				}
+				concealPCM := ConcealG729Loss(rtpPacket.SSRC, lostFrames)
+				if len(concealPCM) > 0 && recordingWriter != nil {
+					if _, writeErr := recordingWriter.Write(concealPCM); writeErr != nil {
+						forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("PLC concealment write failed")
+					} else if metrics.IsMetricsEnabled() {
+						metrics.RecordRTPDroppedPackets("plc_concealed", float64(lostPackets))
+					}
+				}
+				lostPackets = 0
+			}
+
 			// Use stateful decoder for G.729 to maintain decoder state across packets
 			var pcm []byte
 			var err error
-			if codecName == "G729" || codecName == "G.729" || codecName == "G729A" {
+			if isG729 {
 				pcm, err = DecodeG729WithSSRC(payload, rtpPacket.SSRC)
 			} else {
 				pcm, err = DecodeAudioPayload(payload, codecName)
@@ -631,64 +694,19 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 				return
 			}
 
-			// Packet loss concealment (PLC): insert silence for missing packets so the
-			// recording stays time-accurate and stereo combine aligns both legs.
-			// Skip PLC when the RTP timestamp gap indicates a DTX silence period
-			// (G.729 Annex B / comfort noise suppression). RTP timestamps reflect the
-			// source audio timeline and are immune to network jitter or PBX buffering.
-			sampleRate := currentSampleRate
-			if sampleRate <= 0 {
-				sampleRate = 8000
-			}
-			isReordered := false
-			// 60ms of audio samples at the current rate; gaps larger than this are DTX
-			dtxTimestampThreshold := uint32(sampleRate * 60 / 1000)
-			if lastSeq != nil {
-				expectedNext := uint16(*lastSeq + 1)
-				seq := rtpPacket.SequenceNumber
-				if seq != expectedNext {
-					// Reordered (late) packet: seq is earlier than lastSeq in the 16-bit window.
-					// uint16(*lastSeq-seq) < 32768 means the packet is in the recent half, not wraparound.
-					if uint16(*lastSeq-seq) < 32768 {
-						isReordered = true
-						// Out-of-order arrival: skip PLC, do not insert silence.
-					} else if hasLastTimestamp {
-						// Use RTP timestamp gap to distinguish real packet loss from DTX.
-						// During DTX the timestamp jumps by many packets' worth; during real
-						// loss consecutive packets arrive with a normal timestamp delta.
-						tsGap := rtpPacket.Timestamp - lastTimestamp
-						if tsGap <= dtxTimestampThreshold && recordingWriter != nil {
-							var lost int
-							if seq > expectedNext {
-								lost = int(seq - expectedNext)
-							} else {
-								// Wraparound
-								lost = int(seq) + (65536 - int(expectedNext))
-							}
-							lost -= nonAudioSinceLastAudio
-							if lost < 0 {
-								lost = 0
-							}
-							const maxPLC = 10 // cap at ~200ms at 20ms/packet; enough for transient loss
-							if lost > maxPLC {
-								lost = maxPLC
-							}
-							if lost > 0 {
-								bytesPerPacket := lastDecodedPCMSize
-								if bytesPerPacket <= 0 {
-									bytesPerPacket = PCMBytesPerPacket(codecName, sampleRate)
-								}
-								silenceLen := lost * bytesPerPacket
-								if silenceLen > 0 {
-									silence := make([]byte, silenceLen)
-									if _, writeErr := recordingWriter.Write(silence); writeErr != nil {
-										forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("PLC silence write failed")
-									} else if metrics.IsMetricsEnabled() {
-										metrics.RecordRTPDroppedPackets("plc_concealed", float64(lost))
-									}
-								}
-							}
-						}
+			// Non-G.729 PLC: insert silence for missing packets
+			if !isG729 && lostPackets > 0 && recordingWriter != nil {
+				bytesPerPacket := lastDecodedPCMSize
+				if bytesPerPacket <= 0 {
+					bytesPerPacket = PCMBytesPerPacket(codecName, sampleRate)
+				}
+				silenceLen := lostPackets * bytesPerPacket
+				if silenceLen > 0 {
+					silence := make([]byte, silenceLen)
+					if _, writeErr := recordingWriter.Write(silence); writeErr != nil {
+						forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("PLC silence write failed")
+					} else if metrics.IsMetricsEnabled() {
+						metrics.RecordRTPDroppedPackets("plc_concealed", float64(lostPackets))
 					}
 				}
 			}
