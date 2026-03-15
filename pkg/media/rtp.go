@@ -486,7 +486,8 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 		sttWriter := sttPipeWriter
 
 		var firstPacketReceived bool
-		var lastSeq *uint16 // for PLC: insert silence when sequence gaps are detected
+		var lastSeq *uint16   // for PLC: insert silence when sequence gaps are detected
+		var lastArrivalTime time.Time
 		decodeAndProcess := func(packet []byte, arrival time.Time, remoteAddr *net.UDPAddr) {
 			if len(packet) == 0 {
 				return
@@ -596,41 +597,48 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 
 			// Packet loss concealment (PLC): insert silence for missing packets so the
 			// recording stays time-accurate and stereo combine aligns both legs.
+			// Skip PLC when inter-arrival time is large (G.729 DTX: transmitter stopped sending).
 			sampleRate := currentSampleRate
 			if sampleRate <= 0 {
 				sampleRate = 8000
 			}
 			isReordered := false
+			const dtxThreshold = 60 * time.Millisecond // gaps larger than this are DTX, not packet loss
 			if lastSeq != nil {
 				expectedNext := uint16(*lastSeq + 1)
 				seq := rtpPacket.SequenceNumber
 				if seq != expectedNext {
-				// Reordered (late) packet: seq is earlier than lastSeq in the 16-bit window.
-				// uint16(*lastSeq-seq) < 32768 means the packet is in the recent half, not wraparound.
-				if uint16(*lastSeq-seq) < 32768 {
-					isReordered = true
+					// Reordered (late) packet: seq is earlier than lastSeq in the 16-bit window.
+					// uint16(*lastSeq-seq) < 32768 means the packet is in the recent half, not wraparound.
+					if uint16(*lastSeq-seq) < 32768 {
+						isReordered = true
 						// Out-of-order arrival: skip PLC, do not insert silence.
 					} else {
-						var lost int
-						if seq > expectedNext {
-							lost = int(seq - expectedNext)
-						} else {
-							// Wraparound
-							lost = int(seq) + (65536 - int(expectedNext))
-						}
-						const maxPLC = 100 // cap at ~2s at 20ms/packet to avoid runaway on bad sequence
-						if lost > maxPLC {
-							lost = maxPLC
-						}
-						if lost > 0 && recordingWriter != nil {
-							bytesPerPacket := PCMBytesPerPacket(codecName, sampleRate)
-							silenceLen := lost * bytesPerPacket
-							if silenceLen > 0 {
-								silence := make([]byte, silenceLen)
-								if _, writeErr := recordingWriter.Write(silence); writeErr != nil {
-									forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("PLC silence write failed")
-								} else if metrics.IsMetricsEnabled() {
-									metrics.RecordRTPDroppedPackets("plc_concealed", float64(lost))
+						// Only apply PLC when packets arrived close together (real packet loss during active speech).
+						// Large arrival gap = DTX silence suppression; do not insert silence.
+						arrivalGap := arrival.Sub(lastArrivalTime)
+						if arrivalGap <= dtxThreshold && recordingWriter != nil {
+							var lost int
+							if seq > expectedNext {
+								lost = int(seq - expectedNext)
+							} else {
+								// Wraparound
+								lost = int(seq) + (65536 - int(expectedNext))
+							}
+							const maxPLC = 10 // cap at ~200ms at 20ms/packet; enough for transient loss
+							if lost > maxPLC {
+								lost = maxPLC
+							}
+							if lost > 0 {
+								bytesPerPacket := PCMBytesPerPacket(codecName, sampleRate)
+								silenceLen := lost * bytesPerPacket
+								if silenceLen > 0 {
+									silence := make([]byte, silenceLen)
+									if _, writeErr := recordingWriter.Write(silence); writeErr != nil {
+										forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("PLC silence write failed")
+									} else if metrics.IsMetricsEnabled() {
+										metrics.RecordRTPDroppedPackets("plc_concealed", float64(lost))
+									}
 								}
 							}
 						}
@@ -668,6 +676,7 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 			if !isReordered {
 				seq := rtpPacket.SequenceNumber
 				lastSeq = &seq
+				lastArrivalTime = arrival
 			}
 			if sttWriter != nil && len(transcriptionPayload) > 0 {
 				if _, err := sttWriter.Write(transcriptionPayload); err != nil {
