@@ -212,6 +212,16 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 			forwarder.Cleanup()
 		}()
 
+		// Finalize WAV before Cleanup so the header is updated (runs first on exit).
+		// Ensures recordings are playable if the goroutine exits for any reason.
+		defer func() {
+			if forwarder.WAVWriter != nil {
+				if err := forwarder.WAVWriter.Finalize(); err != nil && forwarder.Logger != nil {
+					forwarder.Logger.WithError(err).WithField("call_uuid", callUUID).Warn("Failed to finalize WAV on RTP goroutine exit")
+				}
+			}
+		}()
+
 		var endSessionMetrics func()
 		if metrics.IsMetricsEnabled() {
 			endSessionMetrics = metrics.StartSessionTimer("rtp_forwarding")
