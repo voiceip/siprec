@@ -182,7 +182,7 @@ type SIPRateLimiter interface {
 // CallData holds information about an active call
 type CallData struct {
 	// Forwarder for RTP packets
-	Forwarder *media.RTPForwarder
+	Forwarder *media.RTPForwarder `json:"-"`
 
 	// SIPREC recording session information
 	RecordingSession *siprec.RecordingSession
@@ -197,10 +197,10 @@ type CallData struct {
 	RemoteAddress string
 
 	// TraceScope links the call to its OpenTelemetry span
-	TraceScope *tracing.CallScope
+	TraceScope *tracing.CallScope `json:"-"`
 
 	// Mutex for protecting mutable fields
-	mu sync.RWMutex
+	mu sync.RWMutex `json:"-"`
 }
 
 // DialogInfo holds information about a SIP dialog
@@ -624,14 +624,15 @@ func (c *CallData) SafeCopy() *CallData {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// Create a copy with the current values
+	// Create a copy with only JSON-serializable values
+	// Note: Forwarder contains channels and net.Conn which cannot be marshaled
+	// TraceScope is also not serializable
 	copy := CallData{
-		Forwarder:        c.Forwarder,
 		RecordingSession: c.RecordingSession,
 		DialogInfo:       c.DialogInfo,
 		LastActivity:     c.LastActivity,
 		RemoteAddress:    c.RemoteAddress,
-		// Note: Don't copy the mutex
+		// Note: Don't copy Forwarder (contains chan struct{}), TraceScope, or mutex
 	}
 	return &copy
 }
