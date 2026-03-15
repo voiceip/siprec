@@ -496,8 +496,9 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 		sttWriter := sttPipeWriter
 
 		var firstPacketReceived bool
-		var lastSeq *uint16   // for PLC: insert silence when sequence gaps are detected
-		var lastArrivalTime time.Time
+		var lastSeq *uint16      // for PLC: insert silence when sequence gaps are detected
+		var lastTimestamp uint32  // RTP timestamp of last processed packet
+		var hasLastTimestamp bool
 		decodeAndProcess := func(packet []byte, arrival time.Time, remoteAddr *net.UDPAddr) {
 			if len(packet) == 0 {
 				return
@@ -607,13 +608,16 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 
 			// Packet loss concealment (PLC): insert silence for missing packets so the
 			// recording stays time-accurate and stereo combine aligns both legs.
-			// Skip PLC when inter-arrival time is large (G.729 DTX: transmitter stopped sending).
+			// Skip PLC when the RTP timestamp gap indicates a DTX silence period
+			// (G.729 Annex B / comfort noise suppression). RTP timestamps reflect the
+			// source audio timeline and are immune to network jitter or PBX buffering.
 			sampleRate := currentSampleRate
 			if sampleRate <= 0 {
 				sampleRate = 8000
 			}
 			isReordered := false
-			const dtxThreshold = 60 * time.Millisecond // gaps larger than this are DTX, not packet loss
+			// 60ms of audio samples at the current rate; gaps larger than this are DTX
+			dtxTimestampThreshold := uint32(sampleRate * 60 / 1000)
 			if lastSeq != nil {
 				expectedNext := uint16(*lastSeq + 1)
 				seq := rtpPacket.SequenceNumber
@@ -623,11 +627,12 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 					if uint16(*lastSeq-seq) < 32768 {
 						isReordered = true
 						// Out-of-order arrival: skip PLC, do not insert silence.
-					} else {
-						// Only apply PLC when packets arrived close together (real packet loss during active speech).
-						// Large arrival gap = DTX silence suppression; do not insert silence.
-						arrivalGap := arrival.Sub(lastArrivalTime)
-						if arrivalGap <= dtxThreshold && recordingWriter != nil {
+					} else if hasLastTimestamp {
+						// Use RTP timestamp gap to distinguish real packet loss from DTX.
+						// During DTX the timestamp jumps by many packets' worth; during real
+						// loss consecutive packets arrive with a normal timestamp delta.
+						tsGap := rtpPacket.Timestamp - lastTimestamp
+						if tsGap <= dtxTimestampThreshold && recordingWriter != nil {
 							var lost int
 							if seq > expectedNext {
 								lost = int(seq - expectedNext)
@@ -686,7 +691,8 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 			if !isReordered {
 				seq := rtpPacket.SequenceNumber
 				lastSeq = &seq
-				lastArrivalTime = arrival
+				lastTimestamp = rtpPacket.Timestamp
+				hasLastTimestamp = true
 			}
 			if sttWriter != nil && len(transcriptionPayload) > 0 {
 				if _, err := sttWriter.Write(transcriptionPayload); err != nil {
