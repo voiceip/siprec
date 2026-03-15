@@ -500,6 +500,7 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 		var lastTimestamp uint32  // RTP timestamp of last processed packet
 		var hasLastTimestamp bool
 		var lastDecodedPCMSize int // actual PCM bytes produced by last decoded packet (for PLC)
+		var nonAudioSinceLastAudio int // non-audio packets (DTMF) seen since last successful audio write; subtracted from PLC gap to avoid spurious silence
 		decodeAndProcess := func(packet []byte, arrival time.Time, remoteAddr *net.UDPAddr) {
 			if len(packet) == 0 {
 				return
@@ -584,6 +585,7 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 					default:
 					}
 				}
+				nonAudioSinceLastAudio++
 				return
 			}
 
@@ -663,6 +665,10 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 								// Wraparound
 								lost = int(seq) + (65536 - int(expectedNext))
 							}
+							lost -= nonAudioSinceLastAudio
+							if lost < 0 {
+								lost = 0
+							}
 							const maxPLC = 10 // cap at ~200ms at 20ms/packet; enough for transient loss
 							if lost > maxPLC {
 								lost = maxPLC
@@ -721,6 +727,7 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 				lastSeq = &seq
 				lastTimestamp = rtpPacket.Timestamp
 				hasLastTimestamp = true
+				nonAudioSinceLastAudio = 0
 			}
 			if sttWriter != nil && len(transcriptionPayload) > 0 {
 				if _, err := sttWriter.Write(transcriptionPayload); err != nil {
