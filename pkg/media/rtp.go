@@ -604,7 +604,7 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 			var pcm []byte
 			var err error
 			if codecName == "G729" || codecName == "G.729" || codecName == "G729A" {
-				pcm, err = DecodeG729WithSSRC(payload, rtpPacket.SSRC)
+				pcm, err = DecodeG729(payload, StreamKey{CallUUID: forwarder.CallUUID, SSRC: rtpPacket.SSRC})
 			} else {
 				pcm, err = DecodeAudioPayload(payload, codecName)
 			}

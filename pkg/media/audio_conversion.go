@@ -331,7 +331,7 @@ func (d *G722Decoder) decodeHigherSubBand(ihigh int) int {
 
 	// Block 1H: Inverse adaptive quantizer
 	wd1 := g722HigherIH[ihigh]
-	wd2 := g722LowerILB[band.nb & 0x1F]
+	wd2 := g722LowerILB[band.nb&0x1F]
 	dhigh := (wd1 * wd2) >> 15
 
 	// Block 2H: Compute reconstructed signal
@@ -435,7 +435,7 @@ func (d *G722Decoder) qmfSynthesis(rlow, rhigh int) (int, int) {
 // within the same stream for proper audio reconstruction.
 type G729DecoderPool struct {
 	mu       sync.RWMutex
-	decoders map[uint32]*g729DecoderEntry
+	decoders map[StreamKey]*g729DecoderEntry
 }
 
 type g729DecoderEntry struct {
@@ -443,17 +443,24 @@ type g729DecoderEntry struct {
 	lastUsed time.Time
 }
 
-// Global decoder pool for G.729 streams
-var g729Pool = &G729DecoderPool{
-	decoders: make(map[uint32]*g729DecoderEntry),
+// StreamKey uniquely identifies a G.729 decoder instance across concurrent calls.
+// Using CallUUID+SSRC prevents collisions when different calls share the same SSRC value.
+type StreamKey struct {
+	CallUUID string
+	SSRC     uint32
 }
 
-// GetDecoder returns a decoder for the given SSRC, creating one if needed
-func (p *G729DecoderPool) GetDecoder(ssrc uint32) *g729.Decoder {
+// Global decoder pool for G.729 streams
+var g729Pool = &G729DecoderPool{
+	decoders: make(map[StreamKey]*g729DecoderEntry),
+}
+
+// GetDecoder returns a decoder for the given StreamKey, creating one if needed
+func (p *G729DecoderPool) GetDecoder(key StreamKey) *g729.Decoder {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	entry, exists := p.decoders[ssrc]
+	entry, exists := p.decoders[key]
 	if exists {
 		entry.lastUsed = time.Now()
 		return entry.decoder
@@ -461,7 +468,7 @@ func (p *G729DecoderPool) GetDecoder(ssrc uint32) *g729.Decoder {
 
 	// Create new decoder
 	decoder := g729.NewDecoder()
-	p.decoders[ssrc] = &g729DecoderEntry{
+	p.decoders[key] = &g729DecoderEntry{
 		decoder:  decoder,
 		lastUsed: time.Now(),
 	}
@@ -469,15 +476,15 @@ func (p *G729DecoderPool) GetDecoder(ssrc uint32) *g729.Decoder {
 	return decoder
 }
 
-// CloseDecoder closes and removes a decoder for the given SSRC
-func (p *G729DecoderPool) CloseDecoder(ssrc uint32) {
+// CloseDecoder closes and removes a decoder for the given StreamKey
+func (p *G729DecoderPool) CloseDecoder(key StreamKey) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if entry, exists := p.decoders[ssrc]; exists {
+	if entry, exists := p.decoders[key]; exists {
 		// #nosec G104 -- decoder cleanup, no meaningful action if close fails
 		_ = entry.decoder.Close()
-		delete(p.decoders, ssrc)
+		delete(p.decoders, key)
 	}
 }
 
@@ -487,11 +494,11 @@ func (p *G729DecoderPool) Cleanup(maxAge time.Duration) {
 	defer p.mu.Unlock()
 
 	now := time.Now()
-	for ssrc, entry := range p.decoders {
+	for key, entry := range p.decoders {
 		if now.Sub(entry.lastUsed) > maxAge {
 			// #nosec G104 -- decoder cleanup, no meaningful action if close fails
 			_ = entry.decoder.Close()
-			delete(p.decoders, ssrc)
+			delete(p.decoders, key)
 		}
 	}
 }
@@ -524,12 +531,12 @@ func isG729Oscillation(decoded []int16) bool {
 
 // DecodeG729WithSSRC decodes G.729 payload using a stateful decoder for the given SSRC.
 // This maintains decoder state across packets for proper audio reconstruction.
-func DecodeG729WithSSRC(payload []byte, ssrc uint32) ([]byte, error) {
+func DecodeG729(payload []byte, key StreamKey) ([]byte, error) {
 	if len(payload) == 0 {
 		return nil, fmt.Errorf("empty G.729 payload")
 	}
 
-	decoder := g729Pool.GetDecoder(ssrc)
+	decoder := g729Pool.GetDecoder(key)
 	decoded := make([]int16, 80)
 
 	// Handle SID frames (2 bytes for G.729B comfort noise)
@@ -576,8 +583,8 @@ func DecodeG729WithSSRC(payload []byte, ssrc uint32) ([]byte, error) {
 }
 
 // CloseG729Stream closes the decoder for a specific stream (call when stream ends)
-func CloseG729Stream(ssrc uint32) {
-	g729Pool.CloseDecoder(ssrc)
+func CloseG729Stream(key StreamKey) {
+	g729Pool.CloseDecoder(key)
 }
 
 // CleanupG729Decoders removes idle decoders (call periodically)
@@ -586,7 +593,7 @@ func CleanupG729Decoders(maxAge time.Duration) {
 }
 
 // decodeG729Packet decodes a G.729 payload to 16-bit PCM using bcg729 library
-// Note: For proper audio quality in streaming scenarios, use DecodeG729WithSSRC
+// Note: For proper audio quality in streaming scenarios, use DecodeG729
 // which maintains decoder state across packets.
 // Each 10-byte frame produces 80 samples (160 bytes of PCM)
 func decodeG729Packet(payload []byte) ([]byte, error) {
@@ -673,8 +680,8 @@ type OpusFrameDecoder struct {
 	sampleRate int
 	channels   int
 	// SILK state
-	silkLPCState  [16]float64
-	silkPrevGain  float64
+	silkLPCState [16]float64
+	silkPrevGain float64
 	// CELT state
 	celtPrevSamples []float64
 	// Common state
@@ -1101,7 +1108,7 @@ func (d *OpusFrameDecoder) generateComfortNoise(samples, channels int) []float64
 	pcm := make([]float64, samples*channels)
 	for i := range pcm {
 		// Low amplitude noise
-		pcm[i] = (float64((i*1103515245+12345)&0x7FFF) / 32768.0 - 0.5) * 0.01
+		pcm[i] = (float64((i*1103515245+12345)&0x7FFF)/32768.0 - 0.5) * 0.01
 	}
 	return pcm
 }
