@@ -498,13 +498,20 @@ func (p *G729DecoderPool) Cleanup(maxAge time.Duration) {
 
 // DecodeG729WithSSRC decodes G.729 payload using a stateful decoder for the given SSRC.
 // This maintains decoder state across packets for proper audio reconstruction.
-func DecodeG729WithSSRC(payload []byte, ssrc uint32) ([]byte, error) {
+// lostFrames is the number of G.729 frames that were lost (missing RTP packets) since the last decode;
+// the decoder is called with frameErased=true for each lost frame (PLC) before decoding the current payload.
+func DecodeG729WithSSRC(payload []byte, ssrc uint32, lostFrames int) ([]byte, error) {
 	if len(payload) == 0 {
 		return nil, fmt.Errorf("empty G.729 payload")
 	}
 
 	decoder := g729Pool.GetDecoder(ssrc)
 	decoded := make([]int16, 80)
+
+	// Packet Loss Concealment: inform decoder of lost frames so it can maintain correct internal state
+	for i := 0; i < lostFrames; i++ {
+		_ = decoder.DecodeWithOptions(nil, true, false, false, decoded) // frameErased=true
+	}
 
 	// Handle SID frames (2 bytes for G.729B comfort noise)
 	if len(payload) == 2 {

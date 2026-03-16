@@ -94,6 +94,15 @@ type RTPForwarder struct {
 	RemoteSSRC uint32
 	RTPStats   *rtpStreamStats
 
+	// G.729 sequence tracking for packet loss concealment (PLC)
+	lastRTPSeq   uint16
+	seqMutex     sync.Mutex
+	rtpSeqGapSum uint64 // cumulative count of lost packets (sequence gaps)
+	rtpSeqGapMax uint32 // maximum gap seen in one step
+
+	// G.729 jitter buffer for reordering out-of-order packets (max 5 packets)
+	G729Jitter *g729JitterBuffer
+
 	rtcpStopChan chan struct{}
 	remoteMutex  sync.Mutex
 }
@@ -216,6 +225,7 @@ func NewRTPForwarder(timeout time.Duration, recordingSession *siprec.RecordingSe
 		MarkedForCleanup:  false, // Not marked for cleanup initially
 		LocalSSRC:         generateRandomSSRC(),
 		RTPStats:          newRTPStreamStats(),
+		G729Jitter:        newG729JitterBuffer(g729JitterBufferSize),
 		rtcpStopChan:      make(chan struct{}, 1),
 	}, nil
 }
@@ -253,6 +263,24 @@ func (f *RTPForwarder) Stop() {
 	f.stopOnce.Do(func() {
 		f.Logger.WithField("call_uuid", f.CallUUID).Info("RTPForwarder.Stop() called - closing StopChan and connections")
 		close(f.StopChan)
+
+		// Release G.729 decoder for this stream so state is not leaked
+		if f.RemoteSSRC != 0 {
+			CloseG729Stream(f.RemoteSSRC)
+		}
+
+		// Diagnostic: log RTP sequence gap summary for G.729 (helps debug distortion)
+		f.seqMutex.Lock()
+		gapSum, gapMax := f.rtpSeqGapSum, f.rtpSeqGapMax
+		f.seqMutex.Unlock()
+		if gapSum > 0 {
+			f.Logger.WithFields(logrus.Fields{
+				"call_uuid":    f.CallUUID,
+				"ssrc":        f.RemoteSSRC,
+				"lost_packets_total": gapSum,
+				"lost_packets_max_gap": gapMax,
+			}).Info("RTP sequence gap summary for call (packet loss may cause G.729 distortion)")
+		}
 
 		// Also close connections immediately to unblock any pending reads
 		// This ensures goroutines exit quickly instead of waiting for timeouts
