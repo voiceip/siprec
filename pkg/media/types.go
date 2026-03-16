@@ -266,7 +266,7 @@ func (f *RTPForwarder) Stop() {
 
 		// Release G.729 decoder for this stream so state is not leaked
 		if f.RemoteSSRC != 0 {
-			CloseG729Stream(f.RemoteSSRC)
+			CloseG729Stream(StreamKey{CallUUID: f.CallUUID, SSRC: f.RemoteSSRC})
 		}
 
 		// Diagnostic: log RTP sequence gap summary for G.729 (helps debug distortion)

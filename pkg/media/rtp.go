@@ -714,7 +714,7 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 						forwarder.rtpSeqGapMax = uint32(lostPackets)
 					}
 					forwarder.seqMutex.Unlock()
-					pcm, err = DecodeG729WithSSRC(poppedPayload, poppedSSRC, lostFrames)
+					pcm, err = DecodeG729(poppedPayload, StreamKey{CallUUID: forwarder.CallUUID, SSRC: poppedSSRC}, lostFrames)
 					if err != nil {
 						forwarder.Logger.WithError(err).WithField("call_uuid", callUUID).Warn("G.729 decode error in jitter drain")
 						if metrics.IsMetricsEnabled() {
