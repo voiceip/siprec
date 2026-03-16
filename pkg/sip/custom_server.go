@@ -3365,11 +3365,15 @@ func (s *CustomSIPServer) finalizeCall(callID string, callState *CallState, reas
 	}).Debug("Starting forwarder cleanup in finalizeCall")
 
 	recordingPaths := make([]string, 0, len(callState.RTPForwarders))
+	var recordingCodec string
 	if len(callState.RTPForwarders) > 0 {
 		s.logger.WithField("call_id", callID).Debug("Cleaning up RTPForwarders array")
 		for _, forwarder := range callState.RTPForwarders {
 			if forwarder == nil {
 				continue
+			}
+			if recordingCodec == "" && forwarder.CodecName != "" {
+				recordingCodec = forwarder.CodecName
 			}
 			forwarder.Stop()
 			forwarder.Cleanup()
@@ -3380,6 +3384,9 @@ func (s *CustomSIPServer) finalizeCall(callID string, callState *CallState, reas
 		callState.RTPForwarders = nil
 	} else if callState.RTPForwarder != nil {
 		s.logger.WithField("call_id", callID).Debug("Cleaning up single RTPForwarder")
+		if callState.RTPForwarder.CodecName != "" {
+			recordingCodec = callState.RTPForwarder.CodecName
+		}
 		callState.RTPForwarder.Stop()
 		callState.RTPForwarder.Cleanup()
 		if callState.RTPForwarder.RecordingPath != "" {
@@ -3401,6 +3408,9 @@ func (s *CustomSIPServer) finalizeCall(callID string, callState *CallState, reas
 		for streamID, forwarder := range callState.StreamForwarders {
 			if forwarder == nil {
 				continue
+			}
+			if recordingCodec == "" && forwarder.CodecName != "" {
+				recordingCodec = forwarder.CodecName
 			}
 			forwarder.Stop()
 			forwarder.Cleanup()
@@ -3427,7 +3437,7 @@ func (s *CustomSIPServer) finalizeCall(callID string, callState *CallState, reas
 
 	callState.PendingAckCSeq = 0
 
-	s.combineRecordingLegs(callID, callState, recordingPaths)
+	s.combineRecordingLegs(callID, callState, recordingPaths, recordingCodec)
 
 	// Release allocated port pairs
 	pm := media.GetPortManager()
@@ -3499,7 +3509,7 @@ func (s *CustomSIPServer) finalizeCall(callID string, callState *CallState, reas
 	}
 }
 
-func (s *CustomSIPServer) combineRecordingLegs(callID string, callState *CallState, recordingPaths []string) {
+func (s *CustomSIPServer) combineRecordingLegs(callID string, callState *CallState, recordingPaths []string, codecName string) {
 	if len(recordingPaths) < 2 {
 		return
 	}
@@ -3537,11 +3547,15 @@ func (s *CustomSIPServer) combineRecordingLegs(callID string, callState *CallSta
 		callState.RecordingSession.ExtendedMetadata["combined_recording_path"] = outputPath
 	}
 
-	s.logger.WithFields(logrus.Fields{
+	fields := logrus.Fields{
 		"call_id": callID,
 		"path":    outputPath,
 		"legs":    len(recordingPaths),
-	}).Info("Combined SIPREC legs into single recording")
+	}
+	if codecName != "" {
+		fields["codec"] = codecName
+	}
+	s.logger.WithFields(fields).Info("Combined SIPREC legs into single recording")
 }
 
 func (s *CustomSIPServer) notifyMetadataEvent(ctx context.Context, session *siprec.RecordingSession, callID, event string, extra map[string]interface{}) {

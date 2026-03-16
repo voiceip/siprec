@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +29,107 @@ import (
 )
 
 // Note: As of Go 1.20, the random number generator is automatically seeded
+
+// g729JitterPacket holds one RTP packet for G.729 jitter buffer reordering.
+type g729JitterPacket struct {
+	seq     uint16
+	payload []byte
+	ssrc    uint32
+}
+
+// g729JitterBuffer reorders G.729 RTP packets by sequence number (up to maxSize packets).
+// Packets are drained in sequence order so the stateful decoder receives them in order.
+const g729JitterBufferSize = 5
+
+type g729JitterBuffer struct {
+	mu            sync.Mutex
+	packets       map[uint16]*g729JitterPacket
+	nextExpected  uint16
+	nextExpectedSet bool
+	maxSize       int
+}
+
+func newG729JitterBuffer(maxSize int) *g729JitterBuffer {
+	if maxSize <= 0 {
+		maxSize = g729JitterBufferSize
+	}
+	return &g729JitterBuffer{
+		packets: make(map[uint16]*g729JitterPacket),
+		maxSize: maxSize,
+	}
+}
+
+func (j *g729JitterBuffer) push(seq uint16, payload []byte, ssrc uint32) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(payload) == 0 {
+		return
+	}
+	// Evict newest (max seq) if at capacity to cap delay
+	for len(j.packets) >= j.maxSize {
+		var maxSeq uint16
+		first := true
+		for s := range j.packets {
+			if first || s > maxSeq {
+				maxSeq = s
+				first = false
+			}
+		}
+		delete(j.packets, maxSeq)
+	}
+	payloadCopy := make([]byte, len(payload))
+	copy(payloadCopy, payload)
+	j.packets[seq] = &g729JitterPacket{seq: seq, payload: payloadCopy, ssrc: ssrc}
+}
+
+// getMinSeq returns the sequence number in the buffer that is next in order after nextExpected (16-bit wrap).
+func (j *g729JitterBuffer) getMinSeq(nextExpected uint16) (uint16, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.packets) == 0 {
+		return 0, false
+	}
+	var minSeq uint16
+	var minDelta uint32 = 0xFFFFFFFF
+	for s := range j.packets {
+		delta := uint32(s) - uint32(nextExpected)
+		if delta < minDelta {
+			minDelta = delta
+			minSeq = s
+		}
+	}
+	return minSeq, true
+}
+
+func (j *g729JitterBuffer) pop(seq uint16) (payload []byte, ssrc uint32, ok bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	p, ok := j.packets[seq]
+	if !ok {
+		return nil, 0, false
+	}
+	delete(j.packets, seq)
+	return p.payload, p.ssrc, true
+}
+
+func (j *g729JitterBuffer) getNextExpected() (uint16, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.nextExpected, j.nextExpectedSet
+}
+
+func (j *g729JitterBuffer) setNextExpected(seq uint16) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.nextExpected = seq
+	j.nextExpectedSet = true
+}
+
+func (j *g729JitterBuffer) size() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return len(j.packets)
+}
 
 type audioMetricsCollector struct {
 	callID      string
@@ -522,6 +624,12 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 
 			if forwarder.RemoteSSRC == 0 {
 				forwarder.RemoteSSRC = rtpPacket.SSRC
+			} else if forwarder.RemoteSSRC != rtpPacket.SSRC {
+				forwarder.Logger.WithFields(logrus.Fields{
+					"call_uuid":     callUUID,
+					"prev_ssrc":    forwarder.RemoteSSRC,
+					"current_ssrc": rtpPacket.SSRC,
+				}).Warn("RTP SSRC change mid-stream; decoder state may be inconsistent for stateful codecs")
 			}
 			if forwarder.RTPStats != nil {
 				forwarder.RTPStats.Update(&rtpPacket, arrival)
@@ -571,14 +679,118 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 				codecName = "PCMU"
 			}
 
-			// Use stateful decoder for G.729 to maintain decoder state across packets
+			isG729 := codecName == "G729" || codecName == "G.729" || codecName == "G729A"
+
+			// G.729: push to jitter buffer and drain in order; non-G.729: decode current packet only
 			var pcm []byte
 			var err error
-			if codecName == "G729" || codecName == "G.729" || codecName == "G729A" {
-				pcm, err = DecodeG729WithSSRC(payload, rtpPacket.SSRC)
-			} else {
-				pcm, err = DecodeAudioPayload(payload, codecName)
+			if isG729 && forwarder.G729Jitter != nil {
+				forwarder.G729Jitter.push(rtpPacket.SequenceNumber, payload, rtpPacket.SSRC)
+				for {
+					nextExp, nextSet := forwarder.G729Jitter.getNextExpected()
+					if !nextSet {
+						nextExp = 0
+					}
+					minSeq, ok := forwarder.G729Jitter.getMinSeq(nextExp)
+					if !ok {
+						break
+					}
+					lostPackets := 0
+					if nextSet {
+						delta := int32(minSeq) - int32(nextExp)
+						if delta > 0 {
+							lostPackets = int(delta)
+						}
+					}
+					lostFrames := lostPackets * 2
+					poppedPayload, poppedSSRC, ok := forwarder.G729Jitter.pop(minSeq)
+					if !ok {
+						break
+					}
+					forwarder.G729Jitter.setNextExpected(minSeq + 1)
+					forwarder.seqMutex.Lock()
+					forwarder.lastRTPSeq = minSeq
+					forwarder.rtpSeqGapSum += uint64(lostPackets)
+					if uint32(lostPackets) > forwarder.rtpSeqGapMax {
+						forwarder.rtpSeqGapMax = uint32(lostPackets)
+					}
+					forwarder.seqMutex.Unlock()
+					pcm, err = DecodeG729(poppedPayload, StreamKey{CallUUID: forwarder.CallUUID, SSRC: poppedSSRC}, lostFrames)
+					if err != nil {
+						forwarder.Logger.WithError(err).WithField("call_uuid", callUUID).Warn("G.729 decode error in jitter drain")
+						if metrics.IsMetricsEnabled() {
+							metrics.RecordRTPDroppedPackets(callUUID, "decode_error", 1)
+						}
+						break
+					}
+					if len(pcm) == 0 {
+						continue
+					}
+					// Diagnostic: flag suspiciously low-energy decode (possible distortion)
+					if len(poppedPayload) > 2 {
+						maxAbs := int16(0)
+						for i := 0; i+2 <= len(pcm); i += 2 {
+							s := int16(pcm[i]) | int16(pcm[i+1])<<8
+							if s < 0 {
+								s = -s
+							}
+							if s > maxAbs {
+								maxAbs = s
+							}
+						}
+						if maxAbs < 10 {
+							forwarder.Logger.WithFields(logrus.Fields{
+								"call_uuid": callUUID,
+								"sequence":  minSeq,
+								"max_sample": maxAbs,
+							}).Debug("G.729 decoded frame has very low energy; possible packet loss or corruption")
+						}
+					}
+					recordingPayload, transcriptionPayload, procErr := prepareRecordingAndTranscriptionPayloads(pcm, forwarder, config.AudioProcessing.Enabled, callUUID)
+					if procErr != nil {
+						forwarder.Logger.WithError(procErr).WithField("call_uuid", callUUID).Debug("Failed to process audio chunk")
+						if metrics.IsMetricsEnabled() {
+							metrics.RecordAudioProcessingError(callUUID, "processing_error", 1)
+						}
+						continue
+					}
+					forwarder.pauseMutex.RLock()
+					paused := forwarder.RecordingPaused
+					forwarder.pauseMutex.RUnlock()
+					if paused {
+						if metrics.IsMetricsEnabled() {
+							metrics.RecordRTPDroppedPackets(callUUID, "recording_paused", 1)
+						}
+						continue
+					}
+					startWrite := time.Now()
+					if _, err := recordingWriter.Write(recordingPayload); err != nil {
+						forwarder.Logger.WithError(err).WithField("call_uuid", callUUID).Error("Failed to write PCM audio to recording")
+						if metrics.IsMetricsEnabled() {
+							metrics.RecordRTPDroppedPackets(callUUID, "write_error", 1)
+						}
+						continue
+					}
+					if sttWriter != nil && len(transcriptionPayload) > 0 {
+						if _, err := sttWriter.Write(transcriptionPayload); err != nil {
+							if errors.Is(err, io.ErrClosedPipe) {
+								forwarder.Logger.WithField("call_uuid", callUUID).Debug("STT stream closed; skipping transcription writes")
+							} else {
+								forwarder.Logger.WithError(err).WithField("call_uuid", callUUID).Warn("Failed to stream audio samples to STT provider")
+							}
+							sttWriter.Close()
+							sttWriter = nil
+						}
+					}
+					if metrics.IsMetricsEnabled() {
+						metrics.RecordRTPLatency(callUUID, time.Since(startWrite))
+					}
+				}
+				return
 			}
+
+			// Non-G.729 or no jitter buffer: decode current packet
+			pcm, err = DecodeAudioPayload(payload, codecName)
 			if err != nil {
 				forwarder.Logger.WithError(err).WithFields(logrus.Fields{
 					"call_uuid":    callUUID,
