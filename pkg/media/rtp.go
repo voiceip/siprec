@@ -623,8 +623,12 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 			}
 			isReordered := false
 			var lostPackets int
-			// 60ms of audio samples at the current rate; gaps larger than this are DTX
-			dtxTimestampThreshold := uint32(sampleRate * 60 / 1000)
+			const maxPLC = 10
+			// Timestamp gap threshold: must cover maxPLC lost packets so that
+			// frame-erasure concealment can run for multi-packet losses.
+			// Real G.729 DTX silence gaps are typically >1s; SID frames on the
+			// same PT update lastSeq so they don't create large gaps.
+			dtxTimestampThreshold := uint32(sampleRate * 500 / 1000) // 500ms
 			if lastSeq != nil {
 				expectedNext := uint16(*lastSeq + 1)
 				seq := rtpPacket.SequenceNumber
@@ -643,7 +647,6 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 							if lostPackets < 0 {
 								lostPackets = 0
 							}
-							const maxPLC = 10
 							if lostPackets > maxPLC {
 								lostPackets = maxPLC
 							}
