@@ -632,72 +632,75 @@ func StartRTPForwarding(ctx context.Context, forwarder *RTPForwarder, callUUID s
 				sampleRate = 8000
 			}
 			isReordered := false
+			dtxTimestampThreshold := uint32(sampleRate * 60 / 1000) // 60 ms
 			if lastSeq != nil {
 				expectedNext := uint16(*lastSeq + 1)
 				seq := rtpPacket.SequenceNumber
 				if seq != expectedNext {
 					if uint16(*lastSeq-seq) < 32768 {
 						isReordered = true
-					} else if hasLastTimestamp && recordingWriter != nil {
+					} else if hasLastTimestamp {
 						tsGap := rtpPacket.Timestamp - lastTimestamp
-
-						// Derive expected per-packet timestamp increment from the
-						// last decode's PCM output to adapt to 10/20/40 ms packing.
-						expectedSamples := uint32(lastDecodedPCMSize / 2)
-						minExp := uint32(sampleRate / 100) // 10 ms floor
-						maxExp := uint32(sampleRate / 10)  // 100 ms ceiling
-						if expectedSamples < minExp || expectedSamples > maxExp {
-							expectedSamples = uint32(sampleRate / 50) // 20 ms default
-						}
-
-						// Upper bound rejects unsigned underflow (timestamp < last
-						// wraps to ~2^32 which far exceeds 120 s of samples).
-						maxReasonableGap := uint32(sampleRate * 120)
-
-						if tsGap > expectedSamples && tsGap <= maxReasonableGap {
-							gapSamples := int(tsGap - expectedSamples)
-
-							var lostPackets int
+						expectedDelta := uint32(sampleRate / 50) // 20 ms per packet
+						if tsGap <= dtxTimestampThreshold && recordingWriter != nil {
+							// Short gap → real packet loss
+							var lost int
 							if seq > expectedNext {
-								lostPackets = int(seq - expectedNext)
+								lost = int(seq - expectedNext)
 							} else {
-								lostPackets = int(seq) + (65536 - int(expectedNext))
+								lost = int(seq) + (65536 - int(expectedNext))
 							}
-
-							// For G.729, advance the decoder through up to 10 lost
-							// frames so the predictor state stays consistent.
-							concealedSamples := 0
-							if g729StreamDec != nil && isG729 {
-								concealCount := lostPackets
-								const maxConceal = 10
-								if concealCount > maxConceal {
-									concealCount = maxConceal
-								}
-								bytesPerPacket := lastDecodedPCMSize
-								if bytesPerPacket <= 0 {
-									bytesPerPacket = 320
-								}
-								concealPCM := g729StreamDec.ConcealPackets(concealCount, bytesPerPacket)
-								if len(concealPCM) > 0 {
-									if _, writeErr := recordingWriter.Write(concealPCM); writeErr != nil {
-										forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("PLC concealment write failed")
+							const maxPLC = 10
+							if lost > maxPLC {
+								lost = maxPLC
+							}
+							if lost > 0 {
+								if g729StreamDec != nil && isG729 {
+									bytesPerPacket := lastDecodedPCMSize
+									if bytesPerPacket <= 0 {
+										bytesPerPacket = 320
 									}
-									concealedSamples = len(concealPCM) / 2
+									concealPCM := g729StreamDec.ConcealPackets(lost, bytesPerPacket)
+									if len(concealPCM) > 0 {
+										if _, writeErr := recordingWriter.Write(concealPCM); writeErr != nil {
+											forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("PLC concealment write failed")
+										} else if metrics.IsMetricsEnabled() {
+											metrics.RecordRTPDroppedPackets("plc_concealed", float64(lost))
+										}
+									}
+								} else {
+									bytesPerPacket := lastDecodedPCMSize
+									if bytesPerPacket <= 0 {
+										bytesPerPacket = PCMBytesPerPacket(codecName, sampleRate)
+									}
+									silenceLen := lost * bytesPerPacket
+									if silenceLen > 0 {
+										silence := make([]byte, silenceLen)
+										if _, writeErr := recordingWriter.Write(silence); writeErr != nil {
+											forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("PLC silence write failed")
+										} else if metrics.IsMetricsEnabled() {
+											metrics.RecordRTPDroppedPackets("plc_concealed", float64(lost))
+										}
+									}
 								}
 							}
-
-							// Fill remaining gap with silence to keep both legs
-							// time-aligned in the combined stereo recording.
-							remainingSamples := gapSamples - concealedSamples
-							if remainingSamples > 0 {
-								silence := make([]byte, remainingSamples*2)
-								if _, writeErr := recordingWriter.Write(silence); writeErr != nil {
-									forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("Gap silence write failed")
+						} else if recordingWriter != nil {
+							// Large gap (ringing / hold): insert silence to keep
+							// both legs time-aligned in the combined stereo recording.
+							// Guard against unsigned underflow (timestamp < last)
+							// by requiring tsGap to fall within a plausible range.
+							const minLargeGapSeconds = 3
+							const maxLargeGapSeconds = 120
+							minLargeGap := uint32(sampleRate * minLargeGapSeconds)
+							maxLargeGap := uint32(sampleRate * maxLargeGapSeconds)
+							if tsGap >= minLargeGap && tsGap <= maxLargeGap {
+								gapSamples := int(tsGap - expectedDelta)
+								if gapSamples > 0 {
+									silence := make([]byte, gapSamples*2)
+									if _, writeErr := recordingWriter.Write(silence); writeErr != nil {
+										forwarder.Logger.WithError(writeErr).WithField("call_uuid", callUUID).Debug("DTX gap silence write failed")
+									}
 								}
-							}
-
-							if metrics.IsMetricsEnabled() {
-								metrics.RecordRTPDroppedPackets("plc_concealed", float64(lostPackets))
 							}
 						}
 					}
