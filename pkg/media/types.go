@@ -613,6 +613,9 @@ func (f *RTPForwarder) Cleanup() {
 	f.SRTPMasterKey = nil
 	f.SRTPMasterSalt = nil
 
+	// Release G.729 decoder if one was allocated for this stream (no-op for other codecs)
+	CloseG729Stream(StreamKey{CallUUID: f.CallUUID, SSRC: f.RemoteSSRC})
+
 	f.Logger.Debug("RTP forwarder resources have been cleaned up")
 }
 
